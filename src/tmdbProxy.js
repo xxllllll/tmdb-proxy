@@ -19,6 +19,22 @@ const hopByHopHeaders = new Set([
     'upgrade'
 ]);
 
+const allowedUpstreamHeaderNames = new Set([
+    'accept',
+    'accept-encoding',
+    'accept-language',
+    'authorization',
+    'cache-control',
+    'content-length',
+    'content-type',
+    'if-modified-since',
+    'if-none-match',
+    'if-range',
+    'pragma',
+    'range',
+    'user-agent'
+]);
+
 function toPositiveInteger(value, fallback) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -111,17 +127,26 @@ function buildCacheKey(url, headers) {
     return parts.join('|');
 }
 
-function buildUpstreamHeaders(req, targetHost) {
+function buildUpstreamHeaders(req, targetHost, options = {}) {
+    const forwardAllHeaders = options.forwardAllHeaders === true;
+    const kind = options.kind === 'image' ? 'image' : 'api';
     const upstreamHeaders = {};
     for (const [headerName, headerValue] of Object.entries(req.headers || {})) {
         const lower = headerName.toLowerCase();
         if (hopByHopHeaders.has(lower)) continue;
         if (lower === 'host') continue;
+        if (!forwardAllHeaders && !allowedUpstreamHeaderNames.has(lower)) continue;
         if (headerValue === undefined) continue;
         upstreamHeaders[headerName] = headerValue;
     }
 
     upstreamHeaders.host = targetHost;
+    if (!upstreamHeaders['user-agent']) {
+        upstreamHeaders['user-agent'] = 'tmdb-proxy/1.0';
+    }
+    if (kind === 'api' && !upstreamHeaders.accept) {
+        upstreamHeaders.accept = 'application/json';
+    }
     return upstreamHeaders;
 }
 
@@ -155,6 +180,11 @@ function createTmdbProxyHandler(options = {}) {
     const tmdbImageBaseUrl =
         options.tmdbImageBaseUrl || process.env.TMDB_IMAGE_BASE_URL || DEFAULT_TMDB_IMAGE_BASE_URL;
 
+    const forwardAllHeaders =
+        typeof options.forwardAllHeaders === 'boolean'
+            ? options.forwardAllHeaders
+            : process.env.UPSTREAM_FORWARD_ALL_HEADERS === 'true';
+
     const cacheDurationMs = toPositiveInteger(process.env.CACHE_DURATION_MS, DEFAULT_CACHE_DURATION_MS);
     const maxCacheSize = toPositiveInteger(process.env.MAX_CACHE_SIZE, DEFAULT_MAX_CACHE_SIZE);
     const maxCacheBodyBytes = toPositiveInteger(process.env.MAX_CACHE_BODY_BYTES, DEFAULT_MAX_CACHE_BODY_BYTES);
@@ -165,6 +195,7 @@ function createTmdbProxyHandler(options = {}) {
         logLine('info', 'config', {
             tmdb_api_origin: new URL(tmdbApiBaseUrl).origin,
             tmdb_image_origin: new URL(tmdbImageBaseUrl).origin,
+            upstream_forward_all_headers: forwardAllHeaders,
             cache_duration_ms: cacheDurationMs,
             max_cache_size: maxCacheSize,
             max_cache_body_bytes: maxCacheBodyBytes
@@ -209,7 +240,7 @@ function createTmdbProxyHandler(options = {}) {
                 port: upstreamUrl.port || 443,
                 method: req.method,
                 path: url.pathname + url.search,
-                headers: buildUpstreamHeaders(req, upstreamUrl.hostname)
+                headers: buildUpstreamHeaders(req, upstreamUrl.hostname, { forwardAllHeaders, kind: 'image' })
             },
             (upstreamRes) => {
                 ctx.upstream_status = upstreamRes.statusCode || 502;
@@ -255,7 +286,7 @@ function createTmdbProxyHandler(options = {}) {
             cache.delete(cacheKey);
         }
 
-        const upstreamHeaders = buildUpstreamHeaders(req, upstreamUrl.hostname);
+        const upstreamHeaders = buildUpstreamHeaders(req, upstreamUrl.hostname, { forwardAllHeaders, kind: 'api' });
 
         const upstreamStart = Date.now();
         const axiosConfig = {
@@ -272,6 +303,16 @@ function createTmdbProxyHandler(options = {}) {
         const response = await axios.request(axiosConfig);
         ctx.upstream_status = response.status;
         ctx.upstream_duration_ms = Date.now() - upstreamStart;
+        ctx.upstream_content_type = response.headers?.['content-type'];
+
+        if (response.status >= 400) {
+            if (response.data && typeof response.data === 'object') {
+                if (typeof response.data.status_code === 'number') ctx.tmdb_status_code = response.data.status_code;
+                if (typeof response.data.status_message === 'string') ctx.tmdb_status_message = response.data.status_message;
+            } else if (typeof response.data === 'string') {
+                ctx.tmdb_status_message = response.data.slice(0, 200);
+            }
+        }
 
         if (req.method === 'HEAD') {
             res.statusCode = response.status;
