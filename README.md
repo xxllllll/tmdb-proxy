@@ -68,6 +68,12 @@ curl -I 'http://localhost:3000/t/p/original/xxxx.jpg'
 - `MAX_CACHE_SIZE`：最大缓存条目数（默认 1000）
 - `MAX_CACHE_BODY_BYTES`：单条缓存最大响应体（默认 1048576）
 
+### 日志与排障
+
+- 容器日志会输出 JSON 行日志（`request.end`/`request.aborted`/`config`），包含 `request_id`、`path`（会对 `api_key` 脱敏）、上游状态/耗时、缓存命中信息等。
+- 每个响应会带 `X-Request-Id`，方便把客户端请求和后端日志关联起来。
+- 如果请求里的 `api_key` 带有零宽字符/空白字符，会自动清理，并在日志里标记 `api_key_sanitized=true`。
+
 ## GitHub Actions 自动构建镜像
 
 仓库内已添加工作流（`.github/workflows/docker.yml`），推送到 `main/master` 或打 tag（`v*`）时会构建并推送到 GHCR：

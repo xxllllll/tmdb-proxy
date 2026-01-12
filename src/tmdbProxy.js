@@ -36,6 +36,50 @@ function sendJson(res, statusCode, body) {
     res.end(JSON.stringify(body));
 }
 
+function logLine(level, event, fields) {
+    const payload = {
+        time: new Date().toISOString(),
+        level,
+        event,
+        ...fields
+    };
+    const writer = level === 'error' ? console.error : console.log;
+    writer(JSON.stringify(payload));
+}
+
+function getHeaderValue(headers, name) {
+    const value = headers?.[name];
+    if (Array.isArray(value)) return value[0];
+    return value;
+}
+
+function getRequestId(req) {
+    const fromHeader = getHeaderValue(req.headers, 'x-request-id');
+    if (typeof fromHeader === 'string' && fromHeader.trim()) return fromHeader.trim();
+    return crypto.randomUUID();
+}
+
+function sanitizeApiKeyValue(value) {
+    if (typeof value !== 'string') return value;
+    return value.replace(/\p{Cf}/gu, '').replace(/\s+/gu, '');
+}
+
+function sanitizeUrlSearchParams(url) {
+    const apiKeyValues = url.searchParams.getAll('api_key');
+    if (apiKeyValues.length === 0) return { api_key_sanitized: false };
+
+    const sanitizedValues = apiKeyValues.map(sanitizeApiKeyValue);
+    const changed = sanitizedValues.some((next, index) => next !== apiKeyValues[index]);
+    if (!changed) return { api_key_sanitized: false };
+
+    url.searchParams.delete('api_key');
+    for (const value of sanitizedValues) {
+        url.searchParams.append('api_key', value);
+    }
+
+    return { api_key_sanitized: true };
+}
+
 function redactUrlForLog(rawUrl) {
     try {
         const url = new URL(rawUrl, 'http://localhost');
@@ -117,6 +161,18 @@ function createTmdbProxyHandler(options = {}) {
 
     const cache = new Map();
 
+    try {
+        logLine('info', 'config', {
+            tmdb_api_origin: new URL(tmdbApiBaseUrl).origin,
+            tmdb_image_origin: new URL(tmdbImageBaseUrl).origin,
+            cache_duration_ms: cacheDurationMs,
+            max_cache_size: maxCacheSize,
+            max_cache_body_bytes: maxCacheBodyBytes
+        });
+    } catch {
+        // ignore config log failures
+    }
+
     function cleanExpiredCache() {
         const now = Date.now();
         for (const [key, value] of cache.entries()) {
@@ -141,8 +197,10 @@ function createTmdbProxyHandler(options = {}) {
     const interval = setInterval(cleanExpiredCache, cacheDurationMs);
     interval.unref?.();
 
-    function proxyImage(req, res, url) {
+    function proxyImage(req, res, url, ctx) {
         const upstreamUrl = new URL(tmdbImageBaseUrl);
+        ctx.proxy = 'image';
+        ctx.upstream_host = upstreamUrl.hostname;
 
         const upstreamReq = https.request(
             {
@@ -154,6 +212,7 @@ function createTmdbProxyHandler(options = {}) {
                 headers: buildUpstreamHeaders(req, upstreamUrl.hostname)
             },
             (upstreamRes) => {
+                ctx.upstream_status = upstreamRes.statusCode || 502;
                 res.statusCode = upstreamRes.statusCode || 502;
                 copyUpstreamHeaders(res, upstreamRes.headers, {
                     includeContentLength: true,
@@ -165,6 +224,7 @@ function createTmdbProxyHandler(options = {}) {
         );
 
         upstreamReq.on('error', (error) => {
+            ctx.error = error?.message || 'upstream_error';
             console.error('TMDB image proxy error:', error);
             if (!res.headersSent) setCorsHeaders(res);
             sendJson(res, 502, { error: 'Bad Gateway', details: error.message });
@@ -173,15 +233,21 @@ function createTmdbProxyHandler(options = {}) {
         req.pipe(upstreamReq);
     }
 
-    async function proxyApi(req, res, url) {
+    async function proxyApi(req, res, url, ctx) {
         const upstreamUrl = new URL(tmdbApiBaseUrl);
         const requestPath = url.pathname + url.search;
+        ctx.proxy = 'api';
+        ctx.upstream_host = upstreamUrl.hostname;
 
         const cacheKey = buildCacheKey(url, req.headers);
 
-        if (isCacheableRequest(req, url) && cache.has(cacheKey)) {
+        const cacheable = isCacheableRequest(req, url);
+        ctx.cache = cacheable ? 'miss' : 'bypass';
+
+        if (cacheable && cache.has(cacheKey)) {
             const cachedData = cache.get(cacheKey);
             if (Date.now() < cachedData.expiry) {
+                ctx.cache = 'hit';
                 console.log('Cache hit:', redactUrlForLog(requestPath));
                 setCorsHeaders(res);
                 return sendJson(res, 200, cachedData.data);
@@ -191,6 +257,7 @@ function createTmdbProxyHandler(options = {}) {
 
         const upstreamHeaders = buildUpstreamHeaders(req, upstreamUrl.hostname);
 
+        const upstreamStart = Date.now();
         const axiosConfig = {
             method: req.method,
             url: `${upstreamUrl.origin}${requestPath}`,
@@ -203,6 +270,8 @@ function createTmdbProxyHandler(options = {}) {
         }
 
         const response = await axios.request(axiosConfig);
+        ctx.upstream_status = response.status;
+        ctx.upstream_duration_ms = Date.now() - upstreamStart;
 
         if (req.method === 'HEAD') {
             res.statusCode = response.status;
@@ -215,16 +284,20 @@ function createTmdbProxyHandler(options = {}) {
             return;
         }
 
-        if (response.status === 200 && isCacheableRequest(req, url)) {
+        if (response.status === 200 && cacheable) {
             const serialized = JSON.stringify(response.data);
             const sizeBytes = Buffer.byteLength(serialized);
             if (sizeBytes <= maxCacheBodyBytes) {
                 checkCacheSize();
                 cache.set(cacheKey, { data: response.data, expiry: Date.now() + cacheDurationMs });
+                ctx.cache = 'store';
                 console.log('Cache miss and stored:', redactUrlForLog(requestPath));
             } else {
+                ctx.cache = 'skip_size';
                 console.log('Response not cached due to size:', sizeBytes);
             }
+        } else if (cacheable) {
+            ctx.cache = 'skip_status';
         }
 
         setCorsHeaders(res);
@@ -235,15 +308,50 @@ function createTmdbProxyHandler(options = {}) {
     return async (req, res) => {
         setCorsHeaders(res);
 
+        const startTime = Date.now();
+        const requestId = getRequestId(req);
+
+        const url = new URL(req.url || '/', 'http://localhost');
+        const sanitizeResult = sanitizeUrlSearchParams(url);
+        const urlForLog = redactUrlForLog(url.pathname + url.search);
+
+        const ctx = {
+            request_id: requestId,
+            method: req.method,
+            path: urlForLog,
+            has_auth: Boolean(req.headers?.authorization),
+            ...sanitizeResult
+        };
+
+        res.setHeader('X-Request-Id', requestId);
+
+        let accessLogged = false;
+        const emitAccessLog = (event) => {
+            if (accessLogged) return;
+            accessLogged = true;
+            logLine('info', event, {
+                ...ctx,
+                status: res.statusCode || 0,
+                duration_ms: Date.now() - startTime
+            });
+        };
+
+        res.on('finish', () => emitAccessLog('request.end'));
+        res.on('close', () => {
+            if (!accessLogged && !res.writableEnded) {
+                ctx.aborted = true;
+                emitAccessLog('request.aborted');
+            }
+        });
+
         if (req.method === 'OPTIONS') {
             res.statusCode = 200;
             res.end();
             return;
         }
 
-        const url = new URL(req.url || '/', 'http://localhost');
-
         if (url.pathname === '/') {
+            ctx.proxy = 'health';
             res.statusCode = 200;
             res.setHeader('Content-Type', 'application/json; charset=utf-8');
             res.end(
@@ -257,12 +365,13 @@ function createTmdbProxyHandler(options = {}) {
 
         try {
             if (isImagePath(url.pathname)) {
-                proxyImage(req, res, url);
+                proxyImage(req, res, url, ctx);
                 return;
             }
 
-            await proxyApi(req, res, url);
+            await proxyApi(req, res, url, ctx);
         } catch (error) {
+            ctx.error = error?.message || 'proxy_error';
             console.error('TMDB proxy error:', error);
             const status = error.response?.status || 500;
             sendJson(res, status, {
