@@ -83,6 +83,7 @@ curl -I 'http://localhost:3000/t/p/original/xxxx.jpg'
 - `PORT`：监听端口（默认 3000）
 - `TMDB_API_BASE_URL`：TMDB API 上游（默认 `https://api.themoviedb.org`）
 - `TMDB_IMAGE_BASE_URL`：TMDB 图片上游（默认 `https://image.tmdb.org`）
+- `UPSTREAM_KEEP_ALIVE`：是否启用上游 keep-alive（默认 `false`）
 - `CACHE_DURATION_MS`：API GET 缓存 TTL（默认 600000）
 - `MAX_CACHE_SIZE`：最大缓存条目数（默认 1000）
 - `MAX_CACHE_BODY_BYTES`：单条缓存最大响应体（默认 1048576）

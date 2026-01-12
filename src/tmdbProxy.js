@@ -185,6 +185,13 @@ function createTmdbProxyHandler(options = {}) {
             ? options.forwardAllHeaders
             : process.env.UPSTREAM_FORWARD_ALL_HEADERS === 'true';
 
+    const upstreamKeepAlive =
+        typeof options.upstreamKeepAlive === 'boolean'
+            ? options.upstreamKeepAlive
+            : process.env.UPSTREAM_KEEP_ALIVE === 'true';
+
+    const upstreamHttpsAgent = upstreamKeepAlive ? new https.Agent({ keepAlive: true }) : undefined;
+
     const cacheDurationMs = toPositiveInteger(process.env.CACHE_DURATION_MS, DEFAULT_CACHE_DURATION_MS);
     const maxCacheSize = toPositiveInteger(process.env.MAX_CACHE_SIZE, DEFAULT_MAX_CACHE_SIZE);
     const maxCacheBodyBytes = toPositiveInteger(process.env.MAX_CACHE_BODY_BYTES, DEFAULT_MAX_CACHE_BODY_BYTES);
@@ -196,6 +203,7 @@ function createTmdbProxyHandler(options = {}) {
             tmdb_api_origin: new URL(tmdbApiBaseUrl).origin,
             tmdb_image_origin: new URL(tmdbImageBaseUrl).origin,
             upstream_forward_all_headers: forwardAllHeaders,
+            upstream_keep_alive: upstreamKeepAlive,
             cache_duration_ms: cacheDurationMs,
             max_cache_size: maxCacheSize,
             max_cache_body_bytes: maxCacheBodyBytes
@@ -233,15 +241,20 @@ function createTmdbProxyHandler(options = {}) {
         ctx.proxy = 'image';
         ctx.upstream_host = upstreamUrl.hostname;
 
+        const upstreamRequestOptions = {
+            protocol: upstreamUrl.protocol,
+            hostname: upstreamUrl.hostname,
+            port: upstreamUrl.port || 443,
+            method: req.method,
+            path: url.pathname + url.search,
+            headers: buildUpstreamHeaders(req, upstreamUrl.hostname, { forwardAllHeaders, kind: 'image' })
+        };
+        if (upstreamHttpsAgent) {
+            upstreamRequestOptions.agent = upstreamHttpsAgent;
+        }
+
         const upstreamReq = https.request(
-            {
-                protocol: upstreamUrl.protocol,
-                hostname: upstreamUrl.hostname,
-                port: upstreamUrl.port || 443,
-                method: req.method,
-                path: url.pathname + url.search,
-                headers: buildUpstreamHeaders(req, upstreamUrl.hostname, { forwardAllHeaders, kind: 'image' })
-            },
+            upstreamRequestOptions,
             (upstreamRes) => {
                 ctx.upstream_status = upstreamRes.statusCode || 502;
                 res.statusCode = upstreamRes.statusCode || 502;
@@ -295,6 +308,9 @@ function createTmdbProxyHandler(options = {}) {
             headers: upstreamHeaders,
             validateStatus: () => true
         };
+        if (upstreamHttpsAgent) {
+            axiosConfig.httpsAgent = upstreamHttpsAgent;
+        }
 
         if (!['GET', 'HEAD'].includes(req.method)) {
             axiosConfig.data = req;
