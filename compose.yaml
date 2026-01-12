@@ -7,8 +7,13 @@ services:
       - "3000:3000"
     environment:
       PORT: 3000
+      HOST: 0.0.0.0
       TMDB_API_BASE_URL: https://api.themoviedb.org
       TMDB_IMAGE_BASE_URL: https://image.tmdb.org
+      UPSTREAM_FORWARD_ALL_HEADERS: false
+      UPSTREAM_KEEP_ALIVE: false
       CACHE_DURATION_MS: 600000
+      CACHE_MISS_SINGLEFLIGHT: false
       MAX_CACHE_SIZE: 1000
       MAX_CACHE_BODY_BYTES: 1048576
+      ACCESS_LOG_SAMPLE_RATE: 1
