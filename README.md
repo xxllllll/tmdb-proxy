@@ -85,6 +85,7 @@ curl -I 'http://localhost:3000/t/p/original/xxxx.jpg'
 - `TMDB_IMAGE_BASE_URL`：TMDB 图片上游（默认 `https://image.tmdb.org`）
 - `UPSTREAM_KEEP_ALIVE`：是否启用上游 keep-alive（默认 `false`）
 - `CACHE_DURATION_MS`：API GET 缓存 TTL（默认 600000）
+- `CACHE_MISS_SINGLEFLIGHT`：是否合并同一 cacheKey 的并发 cache miss（默认 `false`）
 - `MAX_CACHE_SIZE`：最大缓存条目数（默认 1000）
 - `MAX_CACHE_BODY_BYTES`：单条缓存最大响应体（默认 1048576）
 

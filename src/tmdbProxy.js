@@ -197,6 +197,12 @@ function createTmdbProxyHandler(options = {}) {
     const maxCacheBodyBytes = toPositiveInteger(process.env.MAX_CACHE_BODY_BYTES, DEFAULT_MAX_CACHE_BODY_BYTES);
 
     const cache = new Map();
+    const inflight = new Map();
+
+    const cacheMissSingleflight =
+        typeof options.cacheMissSingleflight === 'boolean'
+            ? options.cacheMissSingleflight
+            : process.env.CACHE_MISS_SINGLEFLIGHT === 'true';
 
     try {
         logLine('info', 'config', {
@@ -204,6 +210,7 @@ function createTmdbProxyHandler(options = {}) {
             tmdb_image_origin: new URL(tmdbImageBaseUrl).origin,
             upstream_forward_all_headers: forwardAllHeaders,
             upstream_keep_alive: upstreamKeepAlive,
+            cache_miss_singleflight: cacheMissSingleflight,
             cache_duration_ms: cacheDurationMs,
             max_cache_size: maxCacheSize,
             max_cache_body_bytes: maxCacheBodyBytes
@@ -299,36 +306,118 @@ function createTmdbProxyHandler(options = {}) {
             cache.delete(cacheKey);
         }
 
-        const upstreamHeaders = buildUpstreamHeaders(req, upstreamUrl.hostname, { forwardAllHeaders, kind: 'api' });
+        const fetchFromUpstream = async () => {
+            const upstreamHeaders = buildUpstreamHeaders(req, upstreamUrl.hostname, { forwardAllHeaders, kind: 'api' });
 
-        const upstreamStart = Date.now();
-        const axiosConfig = {
-            method: req.method,
-            url: `${upstreamUrl.origin}${requestPath}`,
-            headers: upstreamHeaders,
-            validateStatus: () => true
-        };
-        if (upstreamHttpsAgent) {
-            axiosConfig.httpsAgent = upstreamHttpsAgent;
-        }
-
-        if (!['GET', 'HEAD'].includes(req.method)) {
-            axiosConfig.data = req;
-        }
-
-        const response = await axios.request(axiosConfig);
-        ctx.upstream_status = response.status;
-        ctx.upstream_duration_ms = Date.now() - upstreamStart;
-        ctx.upstream_content_type = response.headers?.['content-type'];
-
-        if (response.status >= 400) {
-            if (response.data && typeof response.data === 'object') {
-                if (typeof response.data.status_code === 'number') ctx.tmdb_status_code = response.data.status_code;
-                if (typeof response.data.status_message === 'string') ctx.tmdb_status_message = response.data.status_message;
-            } else if (typeof response.data === 'string') {
-                ctx.tmdb_status_message = response.data.slice(0, 200);
+            const upstreamStart = Date.now();
+            const axiosConfig = {
+                method: req.method,
+                url: `${upstreamUrl.origin}${requestPath}`,
+                headers: upstreamHeaders,
+                validateStatus: () => true
+            };
+            if (upstreamHttpsAgent) {
+                axiosConfig.httpsAgent = upstreamHttpsAgent;
             }
+
+            if (!['GET', 'HEAD'].includes(req.method)) {
+                axiosConfig.data = req;
+            }
+
+            const response = await axios.request(axiosConfig);
+
+            const shared = {
+                status: response.status,
+                headers: response.headers,
+                data: response.data,
+                upstream_duration_ms: Date.now() - upstreamStart,
+                upstream_content_type: response.headers?.['content-type'],
+                cache_result: cacheable ? 'skip_status' : 'bypass'
+            };
+
+            if (response.status >= 400) {
+                if (response.data && typeof response.data === 'object') {
+                    if (typeof response.data.status_code === 'number') shared.tmdb_status_code = response.data.status_code;
+                    if (typeof response.data.status_message === 'string')
+                        shared.tmdb_status_message = response.data.status_message;
+                } else if (typeof response.data === 'string') {
+                    shared.tmdb_status_message = response.data.slice(0, 200);
+                }
+            }
+
+            if (response.status === 200 && cacheable) {
+                const serialized = JSON.stringify(response.data);
+                const sizeBytes = Buffer.byteLength(serialized);
+                if (sizeBytes <= maxCacheBodyBytes) {
+                    checkCacheSize();
+                    cache.set(cacheKey, { data: response.data, expiry: Date.now() + cacheDurationMs });
+                    shared.cache_result = 'store';
+                    console.log('Cache miss and stored:', redactUrlForLog(requestPath));
+                } else {
+                    shared.cache_result = 'skip_size';
+                    console.log('Response not cached due to size:', sizeBytes);
+                }
+            }
+
+            return shared;
+        };
+
+        if (cacheable && cacheMissSingleflight) {
+            const existing = inflight.get(cacheKey);
+            if (existing) {
+                ctx.singleflight = 'hit';
+                const waitStart = Date.now();
+                const shared = await existing;
+                ctx.singleflight_wait_ms = Date.now() - waitStart;
+
+                ctx.upstream_status = shared.status;
+                ctx.upstream_duration_ms = shared.upstream_duration_ms;
+                ctx.upstream_content_type = shared.upstream_content_type;
+                if (typeof shared.tmdb_status_code === 'number') ctx.tmdb_status_code = shared.tmdb_status_code;
+                if (typeof shared.tmdb_status_message === 'string') ctx.tmdb_status_message = shared.tmdb_status_message;
+
+                if (shared.cache_result === 'store') {
+                    ctx.cache = 'singleflight';
+                } else {
+                    ctx.cache = shared.cache_result;
+                }
+
+                setCorsHeaders(res);
+                copyUpstreamHeaders(res, shared.headers);
+                sendJson(res, shared.status, shared.data);
+                return;
+            }
+
+            ctx.singleflight = 'miss';
+            const promise = (async () => {
+                try {
+                    return await fetchFromUpstream();
+                } finally {
+                    inflight.delete(cacheKey);
+                }
+            })();
+            inflight.set(cacheKey, promise);
+
+            const shared = await promise;
+            ctx.upstream_status = shared.status;
+            ctx.upstream_duration_ms = shared.upstream_duration_ms;
+            ctx.upstream_content_type = shared.upstream_content_type;
+            if (typeof shared.tmdb_status_code === 'number') ctx.tmdb_status_code = shared.tmdb_status_code;
+            if (typeof shared.tmdb_status_message === 'string') ctx.tmdb_status_message = shared.tmdb_status_message;
+            ctx.cache = shared.cache_result;
+
+            setCorsHeaders(res);
+            copyUpstreamHeaders(res, shared.headers);
+            sendJson(res, shared.status, shared.data);
+            return;
         }
+
+        const response = await fetchFromUpstream();
+        ctx.upstream_status = response.status;
+        ctx.upstream_duration_ms = response.upstream_duration_ms;
+        ctx.upstream_content_type = response.upstream_content_type;
+        if (typeof response.tmdb_status_code === 'number') ctx.tmdb_status_code = response.tmdb_status_code;
+        if (typeof response.tmdb_status_message === 'string') ctx.tmdb_status_message = response.tmdb_status_message;
 
         if (req.method === 'HEAD') {
             res.statusCode = response.status;
@@ -341,20 +430,8 @@ function createTmdbProxyHandler(options = {}) {
             return;
         }
 
-        if (response.status === 200 && cacheable) {
-            const serialized = JSON.stringify(response.data);
-            const sizeBytes = Buffer.byteLength(serialized);
-            if (sizeBytes <= maxCacheBodyBytes) {
-                checkCacheSize();
-                cache.set(cacheKey, { data: response.data, expiry: Date.now() + cacheDurationMs });
-                ctx.cache = 'store';
-                console.log('Cache miss and stored:', redactUrlForLog(requestPath));
-            } else {
-                ctx.cache = 'skip_size';
-                console.log('Response not cached due to size:', sizeBytes);
-            }
-        } else if (cacheable) {
-            ctx.cache = 'skip_status';
+        if (cacheable) {
+            ctx.cache = response.cache_result;
         }
 
         setCorsHeaders(res);
