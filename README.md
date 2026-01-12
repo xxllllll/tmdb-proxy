@@ -88,6 +88,7 @@ curl -I 'http://localhost:3000/t/p/original/xxxx.jpg'
 - `CACHE_MISS_SINGLEFLIGHT`：是否合并同一 cacheKey 的并发 cache miss（默认 `false`）
 - `MAX_CACHE_SIZE`：最大缓存条目数（默认 1000）
 - `MAX_CACHE_BODY_BYTES`：单条缓存最大响应体（默认 1048576）
+- `ACCESS_LOG_SAMPLE_RATE`：访问日志采样率（`0..1`，默认 `1`；仅对 <400 的 `request.end` 生效，4xx/5xx/aborted 仍全量记录）
 
 ### 日志与排障
 

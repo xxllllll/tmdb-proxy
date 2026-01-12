@@ -40,6 +40,14 @@ function toPositiveInteger(value, fallback) {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function toRatio(value, fallback) {
+    const parsed = Number.parseFloat(String(value ?? ''));
+    if (!Number.isFinite(parsed)) return fallback;
+    if (parsed < 0) return 0;
+    if (parsed > 1) return 1;
+    return parsed;
+}
+
 function setCorsHeaders(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
@@ -204,6 +212,8 @@ function createTmdbProxyHandler(options = {}) {
             ? options.cacheMissSingleflight
             : process.env.CACHE_MISS_SINGLEFLIGHT === 'true';
 
+    const accessLogSampleRate = toRatio(process.env.ACCESS_LOG_SAMPLE_RATE, 1);
+
     try {
         logLine('info', 'config', {
             tmdb_api_origin: new URL(tmdbApiBaseUrl).origin,
@@ -211,6 +221,7 @@ function createTmdbProxyHandler(options = {}) {
             upstream_forward_all_headers: forwardAllHeaders,
             upstream_keep_alive: upstreamKeepAlive,
             cache_miss_singleflight: cacheMissSingleflight,
+            access_log_sample_rate: accessLogSampleRate,
             cache_duration_ms: cacheDurationMs,
             max_cache_size: maxCacheSize,
             max_cache_body_bytes: maxCacheBodyBytes
@@ -462,10 +473,18 @@ function createTmdbProxyHandler(options = {}) {
         let accessLogged = false;
         const emitAccessLog = (event) => {
             if (accessLogged) return;
+            const status = res.statusCode || 0;
+            const isSuccess = status > 0 && status < 400;
+            const isEndEvent = event === 'request.end';
+            const shouldSample = isEndEvent && isSuccess && accessLogSampleRate < 1;
+            if (shouldSample && Math.random() >= accessLogSampleRate) {
+                accessLogged = true;
+                return;
+            }
             accessLogged = true;
             logLine('info', event, {
                 ...ctx,
-                status: res.statusCode || 0,
+                status,
                 duration_ms: Date.now() - startTime
             });
         };
