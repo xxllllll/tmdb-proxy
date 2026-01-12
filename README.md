@@ -35,7 +35,13 @@ docker run --rm -p 3000:3000 tmdb-proxy
 或使用 compose：
 
 ```bash
-docker compose up --build
+docker compose -f docker-compose.yml up --build
+```
+
+使用 GHCR 镜像（需要先把 `compose.yaml` 里的镜像地址改成你自己的）：
+
+```bash
+docker compose -f compose.yaml up -d
 ```
 
 ### 示例

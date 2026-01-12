@@ -1,0 +1,14 @@
+services:
+  tmdb-proxy:
+    image: ghcr.io/xxllllll/tmdb-proxy:latest
+    container_name: tmdb-proxy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      TMDB_API_BASE_URL: https://api.themoviedb.org
+      TMDB_IMAGE_BASE_URL: https://image.tmdb.org
+      CACHE_DURATION_MS: 600000
+      MAX_CACHE_SIZE: 1000
+      MAX_CACHE_BODY_BYTES: 1048576
