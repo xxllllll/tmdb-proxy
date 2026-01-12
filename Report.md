@@ -273,11 +273,7 @@ https://doc.traefik.io/traefik/v2.2/middlewares/compress/
 
 ### 5.5 优先级 P2：日志降噪/采样
 
-目前每个请求都会输出结构化日志（`src/tmdbProxy.js:349`）。在图片请求量很大的场景，日志 I/O 可能成为额外开销。可引入 `LOG_LEVEL`/采样策略，仅保留：
-
-- 4xx/5xx
-- API 路径
-- 或抽样 N%
+目前每个请求都会输出结构化日志（`src/tmdbProxy.js:349`）。在图片请求量很大的场景，日志 I/O 可能成为额外开销。可以通过 `ACCESS_LOG_SAMPLE_RATE` 对 `<400` 的 `request.end` 做采样，且保证 4xx/5xx 与 `request.aborted` 仍全量记录（便于排障）。
 
 ## 6. Traefik 配置示例（Docker labels）
 
@@ -322,3 +318,56 @@ services:
 2. 观察指标：对比开启 compress 前后（带宽、平均耗时、95/99 分位），并关注 Traefik CPU。
 3. 应用层优化：实现上游 keep-alive + cache miss singleflight。
 4. 缓存调参（按需）：根据访问模式调整 `MAX_CACHE_BODY_BYTES/MAX_CACHE_SIZE`。
+
+### 8.1 烟测清单（启用/禁用开关都要跑）
+
+以下命令使用占位符表示（不要把真实凭证写入仓库文档/日志）。
+
+**API / 图片基础**
+
+- API（任选其一）：
+  - `curl -sS -D- -o /dev/null 'http://<host>/3/configuration?api_key=<TMDB_API_KEY>'`
+  - `curl -sS -H 'Authorization: Bearer <TMDB_TOKEN>' -D- -o /dev/null 'http://<host>/3/configuration'`
+- 图片：
+  - `curl -sS -I 'http://<host>/t/p/w300/<path>.jpg'`
+
+**CORS**
+
+- 预检：
+
+```bash
+curl -sS -D- -o /dev/null -X OPTIONS \
+  -H 'Origin: https://example.com' \
+  -H 'Access-Control-Request-Method: GET' \
+  -H 'Access-Control-Request-Headers: Authorization' \
+  'http://<host>/3/configuration'
+```
+
+**缓存维度（Authorization / Accept-Language）**
+
+- Authorization：用 token A 连续请求 2 次（第 2 次应 `cache=hit`），再用 token B 请求同一路径（应重新 `cache=miss/store`，不应命中 A 的缓存）。
+- Accept-Language：`-H 'Accept-Language: zh-CN'` 与 `-H 'Accept-Language: en-US'` 不应互相命中缓存。
+
+**gzip 行为（Traefik）**
+
+- API（开启 compress 后应 gzip，关闭后不 gzip）：  
+  `curl -H 'Accept-Encoding: gzip' -I 'http://<host>/3/configuration?api_key=<TMDB_API_KEY>'`
+- 图片（任何情况下都不应 gzip）：  
+  `curl -H 'Accept-Encoding: gzip' -I 'http://<host>/t/p/w300/<path>.jpg'`
+
+### 8.2 分步发布（P0 → P1 → P2）
+
+每一步都建议在“staging/生产等价环境”完成：先跑烟测，再在固定采样窗口内对比第 4.3 节基线指标；有异常立即回滚并记录。
+
+| 步骤 | 变更 | 观察指标（示例） | 回滚 |
+|---|---|---|---|
+| P0 Traefik gzip | 仅 API router 挂 `compress` middleware（图片 router 不挂） | 带宽、API p95/p99、Traefik CPU | 移除 `tmdb-proxy-api.middlewares` 或删除 middleware |
+| P1 keep-alive | `UPSTREAM_KEEP_ALIVE=true` | `upstream_duration_ms` 尾延迟、句柄数/连接数、内存 | `UPSTREAM_KEEP_ALIVE=false` |
+| P1 singleflight | `CACHE_MISS_SINGLEFLIGHT=true` | 上游请求次数、cache miss 风暴是否缓解 | `CACHE_MISS_SINGLEFLIGHT=false` |
+| P2 缓存档位 | 调整 `MAX_CACHE_BODY_BYTES/MAX_CACHE_SIZE`（见 5.4 推荐档位） | cache store/hit、上游请求比例、内存/GC | 恢复默认或上一个档位 |
+| P2 日志采样 | `ACCESS_LOG_SAMPLE_RATE=<0..1>` | 日志量下降且 4xx/5xx/aborted 仍全量 | `ACCESS_LOG_SAMPLE_RATE=1` |
+
+### 8.3 发布记录模板（建议粘贴到工单/变更记录）
+
+| 时间 | 步骤 | 变更内容 | 基线对比（p95/p99/带宽/CPU/内存等） | 结论 | 回滚（是/否） | 备注 |
+|---|---|---|---|---|---|---|

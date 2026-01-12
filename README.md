@@ -63,6 +63,11 @@ curl -H 'Accept-Encoding: gzip' -sS -D- -o /dev/null 'http://localhost/3/configu
 
 - 删除 `compose.traefik.yaml` 中 `tmdb-proxy-api.middlewares=tmdb-proxy-compress@docker` 标签，然后 `docker compose -f compose.traefik.yaml up -d` 重建即可。
 
+### 发布与回归
+
+- 缓存是进程内 `Map`，多副本之间不共享；多副本部署会降低命中率（如需跨副本共享需引入外部缓存）。
+- 基线指标、烟测清单与分步发布记录模板见 `Report.md`。
+
 ### 示例
 
 API（需要你自己的 TMDB 凭证，二选一）：
