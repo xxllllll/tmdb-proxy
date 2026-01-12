@@ -71,6 +71,28 @@ function logLine(level, event, fields) {
     writer(JSON.stringify(payload));
 }
 
+async function sleep(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    await new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+    });
+}
+
+function formatErrorForLog(error) {
+    const axiosConfig = error?.config;
+    const axiosUrl = typeof axiosConfig?.url === 'string' ? redactUrlForLog(axiosConfig.url) : undefined;
+
+    return {
+        error_name: error?.name,
+        error_code: error?.code,
+        error_syscall: error?.syscall,
+        error_message: error?.message,
+        axios_method: axiosConfig?.method,
+        axios_url: axiosUrl
+    };
+}
+
 function getHeaderValue(headers, name) {
     const value = headers?.[name];
     if (Array.isArray(value)) return value[0];
@@ -335,13 +357,40 @@ function createTmdbProxyHandler(options = {}) {
                 axiosConfig.data = req;
             }
 
-            const response = await axios.request(axiosConfig);
+            const retryDelayMs = 50;
+            const isIdempotent = ['GET', 'HEAD'].includes(req.method);
+            const maxAttempts = isIdempotent ? 2 : 1;
+
+            let response;
+            let upstreamAttempts = 0;
+            let upstreamRetryReason;
+            let upstreamRetryDelayMs;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                upstreamAttempts = attempt;
+                ctx.upstream_attempts = attempt;
+                try {
+                    response = await axios.request(axiosConfig);
+                    break;
+                } catch (error) {
+                    const code = error?.code || error?.cause?.code;
+                    const shouldRetry = attempt < maxAttempts && code === 'ECONNRESET';
+                    if (!shouldRetry) throw error;
+                    upstreamRetryReason = 'ECONNRESET';
+                    upstreamRetryDelayMs = retryDelayMs;
+                    ctx.upstream_retry_reason = upstreamRetryReason;
+                    ctx.upstream_retry_delay_ms = upstreamRetryDelayMs;
+                    await sleep(retryDelayMs);
+                }
+            }
 
             const shared = {
                 status: response.status,
                 headers: response.headers,
                 data: response.data,
                 upstream_duration_ms: Date.now() - upstreamStart,
+                upstream_attempts: upstreamAttempts,
+                upstream_retry_reason: upstreamRetryReason,
+                upstream_retry_delay_ms: upstreamRetryDelayMs,
                 upstream_content_type: response.headers?.['content-type'],
                 cache_result: cacheable ? 'skip_status' : 'bypass'
             };
@@ -383,6 +432,10 @@ function createTmdbProxyHandler(options = {}) {
 
                 ctx.upstream_status = shared.status;
                 ctx.upstream_duration_ms = shared.upstream_duration_ms;
+                if (typeof shared.upstream_attempts === 'number') ctx.upstream_attempts = shared.upstream_attempts;
+                if (typeof shared.upstream_retry_reason === 'string') ctx.upstream_retry_reason = shared.upstream_retry_reason;
+                if (typeof shared.upstream_retry_delay_ms === 'number')
+                    ctx.upstream_retry_delay_ms = shared.upstream_retry_delay_ms;
                 ctx.upstream_content_type = shared.upstream_content_type;
                 if (typeof shared.tmdb_status_code === 'number') ctx.tmdb_status_code = shared.tmdb_status_code;
                 if (typeof shared.tmdb_status_message === 'string') ctx.tmdb_status_message = shared.tmdb_status_message;
@@ -412,6 +465,9 @@ function createTmdbProxyHandler(options = {}) {
             const shared = await promise;
             ctx.upstream_status = shared.status;
             ctx.upstream_duration_ms = shared.upstream_duration_ms;
+            if (typeof shared.upstream_attempts === 'number') ctx.upstream_attempts = shared.upstream_attempts;
+            if (typeof shared.upstream_retry_reason === 'string') ctx.upstream_retry_reason = shared.upstream_retry_reason;
+            if (typeof shared.upstream_retry_delay_ms === 'number') ctx.upstream_retry_delay_ms = shared.upstream_retry_delay_ms;
             ctx.upstream_content_type = shared.upstream_content_type;
             if (typeof shared.tmdb_status_code === 'number') ctx.tmdb_status_code = shared.tmdb_status_code;
             if (typeof shared.tmdb_status_message === 'string') ctx.tmdb_status_message = shared.tmdb_status_message;
@@ -426,6 +482,9 @@ function createTmdbProxyHandler(options = {}) {
         const response = await fetchFromUpstream();
         ctx.upstream_status = response.status;
         ctx.upstream_duration_ms = response.upstream_duration_ms;
+        if (typeof response.upstream_attempts === 'number') ctx.upstream_attempts = response.upstream_attempts;
+        if (typeof response.upstream_retry_reason === 'string') ctx.upstream_retry_reason = response.upstream_retry_reason;
+        if (typeof response.upstream_retry_delay_ms === 'number') ctx.upstream_retry_delay_ms = response.upstream_retry_delay_ms;
         ctx.upstream_content_type = response.upstream_content_type;
         if (typeof response.tmdb_status_code === 'number') ctx.tmdb_status_code = response.tmdb_status_code;
         if (typeof response.tmdb_status_message === 'string') ctx.tmdb_status_message = response.tmdb_status_message;
@@ -525,7 +584,10 @@ function createTmdbProxyHandler(options = {}) {
             await proxyApi(req, res, url, ctx);
         } catch (error) {
             ctx.error = error?.message || 'proxy_error';
-            console.error('TMDB proxy error:', error);
+            logLine('error', 'proxy.error', {
+                ...ctx,
+                ...formatErrorForLog(error)
+            });
             const status = error.response?.status || 500;
             sendJson(res, status, {
                 error: error.message,

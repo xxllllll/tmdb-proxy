@@ -100,6 +100,7 @@ curl -I 'http://localhost:3000/t/p/original/xxxx.jpg'
 - 容器日志会输出 JSON 行日志（`request.end`/`request.aborted`/`config`），包含 `request_id`、`path`（会对 `api_key` 脱敏）、上游状态/耗时、缓存命中信息等。
 - 每个响应会带 `X-Request-Id`，方便把客户端请求和后端日志关联起来。
 - 如果请求里的 `api_key` 带有零宽字符/空白字符，会自动清理，并在日志里标记 `api_key_sanitized=true`。
+- 上游 `GET/HEAD` 遇到 `ECONNRESET` 会自动重试 1 次（短延迟）；可用 `upstream_attempts`/`upstream_retry_reason` 排查。
 
 ## GitHub Actions 自动构建镜像
 
