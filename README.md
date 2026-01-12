@@ -32,17 +32,36 @@ docker build -t tmdb-proxy .
 docker run --rm -p 3000:3000 tmdb-proxy
 ```
 
-或使用 compose：
-
-```bash
-docker compose -f docker-compose.yml up --build
-```
-
 使用 GHCR 镜像（需要先把 `compose.yaml` 里的镜像地址改成你自己的）：
 
 ```bash
 docker compose -f compose.yaml up -d
 ```
+
+### Traefik：仅对 API 启用 gzip（图片不压缩）
+
+仓库内提供了可直接运行的示例：`compose.traefik.yaml`。
+
+```bash
+docker compose -f compose.traefik.yaml up -d
+```
+
+验收（示例，按需替换为你能访问的 API/图片路径，且请求需要你自己的 TMDB 凭证）：
+
+```bash
+# API：应出现 Content-Encoding: gzip（建议选一个响应体 > 1400 bytes 的 API）
+curl -H 'Accept-Encoding: gzip' -I 'http://localhost/3/configuration?api_key=<YOUR_TMDB_API_KEY>'
+
+# 图片：不应出现 Content-Encoding: gzip
+curl -H 'Accept-Encoding: gzip' -I 'http://localhost/t/p/w300/<path>.jpg'
+
+# 如 -I 看不到 Content-Encoding，可用 GET 仅抓 header：
+curl -H 'Accept-Encoding: gzip' -sS -D- -o /dev/null 'http://localhost/3/configuration?api_key=<YOUR_TMDB_API_KEY>'
+```
+
+回滚：
+
+- 删除 `compose.traefik.yaml` 中 `tmdb-proxy-api.middlewares=tmdb-proxy-compress@docker` 标签，然后 `docker compose -f compose.traefik.yaml up -d` 重建即可。
 
 ### 示例
 
